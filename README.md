@@ -1,78 +1,42 @@
 # Serverless Expense Pipeline (AWS)
 
-CS 79C final project: an event-driven expense tracker built entirely from AWS managed services and defined in CloudFormation. It is a rebuild of an earlier n8n "Expense Tracker Agent" lab, with the chat agent replaced by an API, explicit validation code, and an event-driven alerting path.
+![CI](https://github.com/mlwere1977/aws-serverless-expense-pipeline/actions/workflows/ci.yml/badge.svg)
+
+CS 79C final project: an event-driven expense tracker built entirely from AWS managed services and defined in CloudFormation. It is a rebuild of an earlier n8n "Expense Tracker Agent" lab, replacing the chat agent with an authenticated REST API, deterministic schema validation, and an event-driven alerting pipeline.
 
 ![Architecture](docs/architecture.png)
 
-## What it does
+## What It Does
 
-1. A client sends `POST /expenses` with either plain English (`"I spent $45 on office supplies yesterday."`) or structured JSON.
-2. **API Gateway** checks the API key and throttles traffic, then invokes the **ingest Lambda**.
-3. The ingest Lambda extracts and validates the fields. Missing or invalid input returns HTTP 400 and nothing is saved (the same confirm-before-saving behaviour the n8n agent enforced with its system prompt).
-4. Valid expenses are written to **DynamoDB**.
-5. DynamoDB Streams invokes the **processor Lambda** for every new item. If the amount is at or above the review threshold (default $500) it publishes an **SNS** email alert.
-6. If the processor keeps failing, the batch goes to an **SQS dead-letter queue**. **CloudWatch** alarms on Lambda errors and on the DLQ email you through the same SNS topic.
+1. A client submits a `POST /expenses` request containing either natural English text (`"I spent $45 on office supplies yesterday."`) or structured JSON.
+2. **Amazon API Gateway** validates the required `x-api-key` header, enforces rate limits via a dedicated usage plan, and invokes the **Ingest Lambda**.
+3. The **Ingest Lambda** parses the input and runs schema validation. If required fields are absent or invalid, it returns `HTTP 400` with descriptive error details and halts execution without writing to storage.
+4. Validated expense records are saved directly to an encrypted **Amazon DynamoDB** table using on-demand capacity.
+5. **DynamoDB Streams** triggers the **Processor Lambda** asynchronously on each `INSERT` event. If the expense amount meets or exceeds the review threshold ($500), it publishes an alert notification via **Amazon SNS**.
+6. If the processor experiences transient or unhandled exceptions, records are retried twice with batch splitting before routing to an **Amazon SQS Dead-Letter Queue (DLQ)**. **Amazon CloudWatch** monitors Lambda invocation errors and DLQ depth, dispatching alarm notices via SNS.
 
-Every response includes `submitted_by` with your name, so the output proves it is your deployment.
+Every successful response includes `"submitted_by": "Mukwaya Lwere"` to confirm deployment identity.
 
-## AWS services used
+## AWS Services & Architecture Rationale
 
-API Gateway, Lambda (x3), DynamoDB (with Streams), SNS, SQS, CloudWatch (Logs and Alarms), IAM, CloudFormation, S3 (deployment artifacts only).
+| Service | Role in Solution | Rejected Alternative | Why Alternative Was Rejected |
+| :--- | :--- | :--- | :--- |
+| **API Gateway** | REST API endpoints, key enforcement, rate limiting | Application Load Balancer (ALB) | ALB carries fixed hourly costs (~$16+/mo) even when idle, while API Gateway is serverless and pay-per-request. |
+| **AWS Lambda** | Ingestion, listing, and stream processing compute | Amazon ECS / Fargate | ECS requires ongoing container tasks and cluster overhead; Lambda scales to zero with no idle compute billing. |
+| **Amazon DynamoDB** | Schemaless persistent operational storage | Amazon RDS (PostgreSQL/MySQL) | RDS requires provisioned instances and continuous connection pool management; DynamoDB offers native event stream integration and zero baseline cost on-demand. |
+| **Amazon SNS** | Operational email alerts for flagged expenses | Amazon SES | SES requires domain validation (DKIM/SPF) and sandbox lifting; SNS provides immediate multi-subscriber notification topics out of the box. |
+| **Amazon SQS** | Dead-letter queue (DLQ) for failed stream batches | Amazon Kinesis Data Streams | Kinesis requires provisioned shard hours and dedicated stream management; SQS DLQ scales transparently with zero idle charges. |
+| **CloudWatch** | 14-day retained logging, metrics, alarm triggers | Third-party APM (Datadog) | CloudWatch provides native integration with Lambda, API Gateway, and CloudFormation without third-party agent licensing fees. |
 
-## Repository layout
+## Repository Layout
 
-```
-template.yaml            CloudFormation (SAM) template: every resource
-src/ingest/              POST /expenses Lambda + expense_parser.py
-src/list_expenses/       GET /expenses Lambda
-src/processor/           DynamoDB Streams consumer that sends alerts
-tests/                   17 unit tests (no AWS account needed)
-deploy.sh                package + deploy with the AWS CLI
+```text
+template.yaml            CloudFormation (SAM) template defining all infrastructure
+src/ingest/              POST /expenses handler + NLP/regex expense_parser.py
+src/list_expenses/       GET /expenses handler (bounded Scan)
+src/processor/           DynamoDB Streams consumer that evaluates thresholds & publishes alerts
+tests/                   17 unit tests for parser and handlers (no AWS connection required)
+deploy.sh                Packaging and CloudFormation deployment script
 scripts/                 get_config.sh, smoke_test.sh, cleanup.sh
-docs/                    architecture diagram, design decisions, Well-Architected review
-.github/workflows/ci.yml runs pytest and cfn-lint on every push
-```
-
-## Deploy
-
-Run these in AWS CloudShell (or any shell with the AWS CLI configured):
-
-```bash
-git clone https://github.com/<your-username>/aws-serverless-expense-pipeline.git
-cd aws-serverless-expense-pipeline
-export STUDENT_NAME="Your Name"
-export ALERT_EMAIL="you@example.com"
-./deploy.sh
-```
-
-Then click **Confirm subscription** in the email from AWS Notifications and run:
-
-```bash
-./scripts/smoke_test.sh
-```
-
-## Try it manually
-
-```bash
-source scripts/get_config.sh
-curl -X POST "$API_URL" -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"message": "I spent $45 on office supplies yesterday."}'
-curl "$API_URL" -H "x-api-key: $API_KEY"
-```
-
-## Run the tests locally
-
-```bash
-pip install -r requirements-dev.txt
-pytest -q
-cfn-lint template.yaml
-```
-
-## Cost
-
-Everything is pay-per-use, and the usage plan caps the API at 1,000 requests per month. Typical project usage costs well under a dollar; log retention is 14 days. See `docs/well-architected-review.md` for the full cost reasoning, and run `./scripts/cleanup.sh` to delete everything.
-
-## Documentation
-
-- [Design decisions and rejected alternatives](docs/design-decisions.md)
-- [Well-Architected self-review](docs/well-architected-review.md)
+docs/                    architecture.png, design-decisions.md, well-architected-review.md
+.github/workflows/ci.yml GitHub Actions workflow running pytest and cfn-lint
