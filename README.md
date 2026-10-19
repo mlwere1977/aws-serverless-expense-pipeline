@@ -2,7 +2,7 @@
 
 ![CI](https://github.com/mlwere1977/aws-serverless-expense-pipeline/actions/workflows/ci.yml/badge.svg)
 
-CS 79C final project: an event-driven expense tracker built entirely from AWS managed services and defined in CloudFormation. It is a rebuild of an earlier n8n "Expense Tracker Agent" lab, replacing the chat agent with an authenticated REST API, deterministic schema validation, and an event-driven alerting pipeline.
+An event-driven expense tracker built entirely from AWS managed services and defined in CloudFormation. It is a rebuild of an earlier n8n "Expense Tracker Agent" lab, replacing the chat agent with an authenticated REST API, deterministic schema validation, and an event-driven alerting pipeline.
 
 ![Architecture](docs/architecture.png)
 
