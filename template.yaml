@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless, event-driven expense tracker. API Gateway -> Lambda -> DynamoDB,
+  then DynamoDB Streams -> Lambda -> SNS email alerts for large expenses.
+  Failures go to an SQS dead-letter queue and trigger CloudWatch alarms.
+
+Parameters:
+  StudentName:
+    Type: String
+    MinLength: 1
+    MaxLength: 60
+    Description: Your name. Returned in every API response so it is visible in screenshots.
+  AlertEmail:
+    Type: String
+    AllowedPattern: "[^@\\s]+@[^@\\s]+\\.[^@\\s]+"
+    Description: Email address that receives large-expense and alarm notifications.
+  ReviewThreshold:
+    Type: Number
+    Default: 500
+    MinValue: 1
+    Description: Expenses at or above this amount (USD) trigger a "needs review" email.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    MemorySize: 128
+    Timeout: 10
+    Environment:
+      Variables:
+        STUDENT_NAME: !Ref StudentName
+
+Resources:
+  # ---------------------------------------------------------------- Storage
+  ExpensesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: expense_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: expense_id
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # --------------------------------------------------- Messaging and failure
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Expense pipeline alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  ProcessorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # -------------------------------------------------------------------- API
+  ExpenseApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Auth:
+        ApiKeyRequired: true
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          UsagePlanName: expense-pipeline-plan
+          Description: Caps traffic so a leaked key cannot run up the bill.
+          Throttle:
+            BurstLimit: 10
+            RateLimit: 5
+          Quota:
+            Limit: 1000
+            Period: MONTH
+
+  # ----------------------------------------------------------------- Compute
+  IngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-ingest"
+      RetentionInDays: 14
+
+  ListLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-list"
+      RetentionInDays: 14
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-processor"
+      RetentionInDays: 14
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: IngestLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-ingest"
+      Description: Parses and validates an expense, then writes it to DynamoDB.
+      CodeUri: src/ingest/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ExpensesTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt ExpensesTable.Arn
+      Events:
+        PostExpense:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ExpenseApi
+            Path: /expenses
+            Method: post
+
+  ListFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ListLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-list"
+      Description: Returns recent expenses, newest first.
+      CodeUri: src/list_expenses/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ExpensesTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Scan
+              Resource: !GetAtt ExpensesTable.Arn
+      Events:
+        GetExpenses:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ExpenseApi
+            Path: /expenses
+            Method: get
+
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ProcessorLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-processor"
+      Description: Reacts to new DynamoDB items and emails an alert for large expenses.
+      CodeUri: src/processor/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref AlertsTopic
+          REVIEW_THRESHOLD: !Ref ReviewThreshold
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref AlertsTopic
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt ProcessorDLQ.Arn
+      Events:
+        ExpenseStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt ExpensesTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 10
+            MaximumRetryAttempts: 2
+            MaximumRecordAgeInSeconds: 3600
+            BisectBatchOnFunctionError: true
+            DestinationConfig:
+              OnFailure:
+                Type: SQS
+                Destination: !GetAtt ProcessorDLQ.Arn
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"eventName": ["INSERT"]}'
+
+  # ------------------------------------------------------------- Monitoring
+  IngestErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The ingest Lambda raised an unhandled error.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  ProcessorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The stream processor Lambda raised an error.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessorFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A stream batch exhausted its retries and landed in the DLQ.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ProcessorDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+Outputs:
+  ApiUrl:
+    Description: POST (create) and GET (list) endpoint. Requires the x-api-key header.
+    Value: !Sub "https://${ExpenseApi}.execute-api.${AWS::Region}.amazonaws.com/prod/expenses"
+  TableName:
+    Value: !Ref ExpensesTable
+  TopicArn:
+    Value: !Ref AlertsTopic
+  DeadLetterQueueUrl:
+    Value: !Ref ProcessorDLQ
