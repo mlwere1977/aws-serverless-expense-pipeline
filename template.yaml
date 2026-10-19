@@ -1,19 +1,25 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Serverless, event-driven expense tracker. API Gateway -> Lambda -> DynamoDB,
+  Serverless, event-driven expense tracker portfolio project. API Gateway -> Lambda -> DynamoDB,
   then DynamoDB Streams -> Lambda -> SNS email alerts for large expenses.
-  Failures go to an SQS dead-letter queue and trigger CloudWatch alarms.
+  Failures route to an SQS dead-letter queue and trigger CloudWatch alarms.
+
+Metadata:
+  Project: CS79C-AWS-Expense-Pipeline
+  Author: Mukwaya Lwere
 
 Parameters:
   StudentName:
     Type: String
     MinLength: 1
     MaxLength: 60
+    Default: "Mukwaya Lwere"
     Description: Your name. Returned in every API response so it is visible in screenshots.
   AlertEmail:
     Type: String
     AllowedPattern: "[^@\\s]+@[^@\\s]+\\.[^@\\s]+"
+    Default: "lwere_mukwaya01@student.smc.edu"
     Description: Email address that receives large-expense and alarm notifications.
   ReviewThreshold:
     Type: Number
@@ -49,6 +55,11 @@ Resources:
         SSEEnabled: true
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: ExpensePipeline
+        - Key: Owner
+          Value: !Ref StudentName
 
   # --------------------------------------------------- Messaging and failure
   AlertsTopic:
@@ -248,8 +259,11 @@ Outputs:
     Description: POST (create) and GET (list) endpoint. Requires the x-api-key header.
     Value: !Sub "https://${ExpenseApi}.execute-api.${AWS::Region}.amazonaws.com/prod/expenses"
   TableName:
+    Description: DynamoDB table name storing persistent expense records.
     Value: !Ref ExpensesTable
   TopicArn:
+    Description: SNS topic ARN for review alerts and operational monitoring.
     Value: !Ref AlertsTopic
   DeadLetterQueueUrl:
+    Description: SQS DLQ URL capturing exhausted processor stream failures.
     Value: !Ref ProcessorDLQ
